@@ -238,7 +238,7 @@ parser.add_argument("--resume", action="store_true", dest="resume",
         help="load from exp_dir if True")
 parser.add_argument("--config-file", type=str, default='matchmap', choices=['matchmap'], help="Model config file.")
 parser.add_argument("--restore-epoch", type=int, default=-1, help="Epoch to generate accuracies for.")
-parser.add_argument("--image-base", default="..", help="Model config file.")
+parser.add_argument("--image-base", default="/storage", help="Model config file.")
 command_line_args = parser.parse_args()
 restore_epoch = command_line_args.restore_epoch
 
@@ -342,16 +342,38 @@ else:
         rank, False
         )
 
-audio_model.eval()
-image_model.eval()
-attention.eval()
-contrastive_loss.eval()
 image_base = Path('../Datasets/spokencoco/')
 episodes = np.load(args["episodes_test"], allow_pickle=True)['episodes'].item()
 
 with torch.no_grad():
+
+    matching_set_images = []
+    matching_set_labels = []
+    im_used = set()
+    counting = {}
+    print(len(episodes['matching_set']))
+    for im in tqdm(episodes['matching_set']):
+
+        imgpath = image_base / im
+        this_image = LoadImage(imgpath, resize, image_normalize, to_tensor)
+        this_image_output = image_model(this_image.unsqueeze(0).to(rank))
+        this_image_output = this_image_output.view(this_image_output.size(0), this_image_output.size(1), -1).transpose(1, 2)
+        # this_image_output = this_image_output.mean(dim=1)
+        matching_set_images.append(this_image_output)
+        matching_set_labels.append(episodes['matching_set'][im])
+        
+        for w in list(episodes['matching_set'][im]):
+            if w not in concepts: continue
+            if w not in counting: counting[w] = 0
+            counting[w] += 1
+            # if counting[w] == 10: break
+
+    print(counting)
+
+    matching_set_images = torch.cat(matching_set_images, axis=0)
+
     acc = []
-    for i_test in range(1):
+    for i_test in range(5):
         print(f'\nTest number {i_test+1}-----------------------------------')
         results = {}
         cos = nn.CosineSimilarity(dim=1, eps=1e-6)
@@ -362,34 +384,12 @@ with torch.no_grad():
         episode_names = list(episodes.keys())
         episode_names.remove('matching_set')
 
-        # episode_names = np.random.choice(episode_names, 100, replace=False)
+        episode_names = np.random.choice(episode_names, 100, replace=False)
 
-        for episode_num in tqdm(sorted(episode_names)):
+
+        for episode_num in tqdm(episode_names):
 
             episode = episodes[episode_num]
-            
-            m_images = []
-            m_labels = []
-            counting = {}
-
-            for w in episode['matching_set']:
-
-                imgpath = image_base / episode['matching_set'][w]
-                this_image = LoadImage(imgpath, resize, image_normalize, to_tensor)
-                this_image_output = image_model(this_image.unsqueeze(0).to(rank))
-                this_image_output = this_image_output.view(this_image_output.size(0), this_image_output.size(1), -1).transpose(1, 2)
-                # this_image_output = this_image_output.mean(dim=1)
-                m_images.append(this_image_output)
-                m_labels.append(w)
-
-            for w in list(episode['matching_set']):
-                if w not in concepts: continue
-                if w not in counting: counting[w] = 0
-                counting[w] += 1
-                # if counting[w] == 10: break
-
-            m_images = torch.cat(m_images, axis=0)
-    
             for w in episode['queries']:
                 if w not in results: results[w] = {'correct': 0, 'total': 0}
                 wav, spkr = episode['queries'][w]
@@ -401,31 +401,32 @@ with torch.no_grad():
                         this_english_audio_feat, this_english_nframes = LoadAudio(image_base / 'SpokenCOCO' / wav, alignments[lookup][w], audio_conf)
                         this_english_audio_feat, this_english_nframes = PadFeat(this_english_audio_feat, target_length, padval)
                         _, _, query = audio_model(this_english_audio_feat.to(rank))
-                        n_frames = NFrames(this_english_audio_feat, query, this_english_nframes) 
-                        scores = attention.module.one_to_many_score(m_images, query, n_frames).squeeze()
+                        n_frames = NFrames(this_english_audio_feat, query, this_english_nframes)  
 
-                        # indices = torch.argsort(scores, descending=True)[0: counting[w]]
-                        # for ind in range(counting[w]):
-                        ind = torch.argmax(scores).item()
-                        if w in m_labels[ind]: 
-                            results[w]['correct'] += 1
-                        results[w]['total'] += 1
-            
-            
-        c = 0
-        t = 0
-        for w in results:
-            correct = results[w]['correct']
-            total = results[w]['total']
-            c += correct
-            t += total
-            percentage = 100*correct/total
-            print(f'{w}: {correct}/{total}={percentage:<.2f}%')
-        percentage = c/t
-        print(f'Overall: {c}/{t}={percentage}={100*percentage:<.2f}%')
+                        scores = attention.module.one_to_many_score(matching_set_images, query, n_frames).squeeze()
 
-        acc.append(100*percentage)
+                        indices = torch.argsort(scores, descending=True)[0: counting[w]]
+                        for ind in range(counting[w]):
+                            
+                            # for c in matching_set_labels[indices[ind]]:
 
-    avg = np.mean(np.asarray(acc))
-    var = np.std(np.asarray(acc))
-    print(f'\nOverall mean {avg}% and std {var}%')
+                            #     if re.search(w, c) is not None:
+                            #         print(ind, scores[indices[ind]])
+                            if w in matching_set_labels[indices[ind]]: 
+                                # print(ind)
+                                correct += 1
+                            total += 1
+                            # if ind == 5: break
+
+                        c += correct
+                        t += total
+                        percentage = 100*correct/total
+                        print(f'{w}: {correct}/{total}={percentage:<.2f}%')
+                    percentage = c/t
+                    print(f'Overall: {c}/{t}={percentage}={100*percentage:<.2f}%')
+
+    #     acc.append(100*percentage)
+
+    # avg = np.mean(np.asarray(acc))
+    # var = np.std(np.asarray(acc))
+    # print(f'\nOverall mean {avg}% and std {var}%')
